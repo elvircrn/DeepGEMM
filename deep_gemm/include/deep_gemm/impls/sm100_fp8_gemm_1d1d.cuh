@@ -545,6 +545,13 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     }
                 }
             }
+
+            // PDL: Signal that this block's output tile is written to GMEM.
+            // A dependent consumer kernel can start processing completed tiles.
+            if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                cute::tma_store_wait<0>();  // ensure all TMA stores landed
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
         }
 
         // Deallocate tensor memory by the last UMMA store warp
