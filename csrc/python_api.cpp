@@ -20,6 +20,7 @@
 #include "apis/nvfp4_mega_moe.hpp"
 #include "apis/mega_mhc.hpp"
 #include "apis/mega_gate.hpp"
+#include "apis/symm_buffer_fabric.hpp"
 
 namespace deep_gemm {
 static void ensure_jit() { (void)jit.get(); }

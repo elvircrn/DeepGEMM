@@ -421,6 +421,26 @@ def get_token_alignment_for_mega_moe():
     return _torch_ops.get_token_alignment_for_mega_moe()
 
 
+def fabric_symm_buffer_supported():
+    return _torch_ops.fabric_symm_buffer_supported()
+
+
+def fabric_symm_buffer_alloc(num_bytes):
+    return _torch_ops.fabric_symm_buffer_alloc(num_bytes)
+
+
+def fabric_symm_buffer_import(desc, num_bytes):
+    return _torch_ops.fabric_symm_buffer_import(desc, num_bytes)
+
+
+def fabric_symm_buffer_view(data_ptr, num_bytes):
+    return _torch_ops.fabric_symm_buffer_view(data_ptr, num_bytes)
+
+
+def fabric_symm_buffer_free(data_ptr):
+    return _torch_ops.fabric_symm_buffer_free(data_ptr)
+
+
 def get_block_m_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_tokens, num_topk, mma_type):
     return _torch_ops.get_block_m_for_mega_moe(
         num_ranks, num_experts, num_max_tokens_per_rank, num_tokens, num_topk, mma_type

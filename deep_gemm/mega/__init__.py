@@ -1,7 +1,8 @@
+import os
 import torch
 import types
 import warnings
-from typing import Tuple, Optional, Union
+from typing import Any, Optional, Tuple, Union
 from ..utils.math import align
 
 # noinspection PyBroadException
@@ -17,10 +18,77 @@ from .. import _C
 
 _SUPPORTED_ACTIVATIONS = ('swiglu', 'swiglustep', 'situ')
 
+# How the multi-rank buffer is set up: `auto` tries `torch._symmetric_memory` first and
+# falls back to CUDA fabric handles when that fails (CUDA IPC handles cannot cross OS
+# instances, fabric handles span every OS instance of one NVLink fabric, e.g. a
+# partitioned NVL72); `fabric` and `symm_mem` force one path
+_SYMM_BUFFER_BACKEND = os.getenv('DG_SYMM_BUFFER_BACKEND', 'auto').lower()
+
 
 def _validate_activation(activation: str) -> None:
     assert activation in _SUPPORTED_ACTIVATIONS, \
         f'Activation must be one of {_SUPPORTED_ACTIVATIONS}, got `{activation}`'
+
+
+def _all_gather_int64(tensor: torch.Tensor, group: 'dist.ProcessGroup') -> list:
+    # The payload is opaque data, so any backend works; gloo wants CPU tensors,
+    # NCCL-only groups need the current CUDA device
+    gathered = [torch.empty_like(tensor) for _ in range(group.size())]
+    try:
+        dist.all_gather(gathered, tensor, group=group)
+        return gathered
+    except RuntimeError:
+        device = torch.empty(0, device='cuda').device
+        src = tensor.to(device)
+        gathered = [torch.empty_like(src) for _ in range(group.size())]
+        dist.all_gather(gathered, src, group=group)
+        return [t.cpu() for t in gathered]
+
+
+def _create_fabric_symm_buffer(num_bytes: int, group: 'dist.ProcessGroup') -> Tuple[torch.Tensor, Any, list]:
+    # Allocate through CUDA fabric handles and exchange the 64-byte descriptors over
+    # `group`, so the buffer spans every OS instance of one NVLink fabric; the kernels
+    # consume the local mappings of each rank's allocation as plain `buffer_ptrs`
+    assert _C.fabric_symm_buffer_supported(), \
+        'CUDA fabric handles are unavailable on this device (no NVLink fabric, or the ' \
+        'fabric/IMEX service is down, see docs/mega-moe-nvl72.md)'
+    buffer, desc = _C.fabric_symm_buffer_alloc(num_bytes)
+    rank = group.rank()
+    descs = _all_gather_int64(torch.tensor(desc, dtype=torch.int64), group)
+
+    buffer_ptrs = [0] * group.size()
+    buffer_ptrs[rank] = buffer.data_ptr()
+    try:
+        for r, d in enumerate(descs):
+            if r != rank:
+                buffer_ptrs[r] = _C.fabric_symm_buffer_import(d.tolist(), buffer.nbytes)
+    except Exception:
+        for ptr in buffer_ptrs:
+            if ptr != 0:
+                _C.fabric_symm_buffer_free(ptr)
+        raise
+    return buffer, types.SimpleNamespace(buffer_ptrs=buffer_ptrs), buffer_ptrs
+
+
+def _create_symm_buffer(num_bytes: int, group: 'dist.ProcessGroup') -> Tuple[torch.Tensor, Any, Optional[list]]:
+    # Returns the buffer, its handle and, for the fabric path, the mapped pointers to
+    # free on `destroy` (the owner frees; buffers reused through `base` share them)
+    assert _SYMM_BUFFER_BACKEND in ('auto', 'fabric', 'symm_mem'), \
+        f'DG_SYMM_BUFFER_BACKEND must be one of auto/fabric/symm_mem, got `{_SYMM_BUFFER_BACKEND}`'
+    if _SYMM_BUFFER_BACKEND != 'fabric':
+        if symm_mem is None:
+            assert _SYMM_BUFFER_BACKEND == 'auto', \
+                'torch.distributed._symmetric_memory is unavailable; set DG_SYMM_BUFFER_BACKEND=fabric'
+        else:
+            try:
+                buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
+                return buffer, symm_mem.rendezvous(buffer, group=group), None
+            except Exception as exception:
+                assert _SYMM_BUFFER_BACKEND == 'auto', \
+                    f'DG_SYMM_BUFFER_BACKEND=symm_mem failed: {exception}'
+                print(f'torch._symmetric_memory failed ({exception}), '
+                      'using CUDA fabric handles instead')
+    return _create_fabric_symm_buffer(num_bytes, group)
 
 
 class SymmBuffer:
@@ -56,13 +124,12 @@ class SymmBuffer:
             num_shared_experts
         )
         if base is None:
-            allocator = torch if group.size() == 1 else symm_mem
-            self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
-            self.handle = (
-                types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
-                if group.size() == 1
-                else symm_mem.rendezvous(self.buffer, group=group)
-            )
+            if group.size() == 1:
+                self.buffer = torch.empty(num_bytes, dtype=torch.int8, device='cuda')
+                self.handle = types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
+                self._fabric_free_ptrs = None
+            else:
+                self.buffer, self.handle, self._fabric_free_ptrs = _create_symm_buffer(num_bytes, group)
             self.buffer.zero_()
             self.group.barrier()
             torch.cuda.synchronize()
@@ -74,6 +141,7 @@ class SymmBuffer:
                  f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
             self.buffer = base.buffer
             self.handle = base.handle
+            self._fabric_free_ptrs = None
 
         # Create input buffer views
         (self.x, self.x_sf,
@@ -84,6 +152,12 @@ class SymmBuffer:
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
 
     def destroy(self):
+        # Collective: every rank must call this after a `group.barrier()`;
+        # instances reusing a `base` buffer do not free (the owner does)
+        if self._fabric_free_ptrs is not None:
+            for ptr in self._fabric_free_ptrs:
+                _C.fabric_symm_buffer_free(ptr)
+            self._fabric_free_ptrs = None
         self.handle = None
         self.buffer = None
         self.group = None

@@ -111,11 +111,12 @@ For more details and the paged version `fp8_fp4_paged_mqa_logits`, please refer 
 
 #### Mega MoE
 
-Mega MoE fuses and overlaps EP dispatch, linear 1 and linear 2 (FP8xFP4 or FP8xFP8), a gated activation, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
+Mega MoE fuses and overlaps EP dispatch, linear 1 and linear 2 (FP8xFP4 or FP8xFP8), a gated activation, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. On one NVLink fabric split across multiple OS instances (e.g. a partitioned NVL72), the buffer is set up through CUDA fabric handles instead; see `docs/mega-moe-nvl72.md`. Usage:
 
 ```python
 # Allocate symmetric memory buffer
-# NOTES: requires PyTorch >= 2.9
+# NOTES: requires PyTorch >= 2.9 with torch._symmetric_memory, or CUDA fabric handles
+#        (DG_SYMM_BUFFER_BACKEND, see docs/mega-moe-nvl72.md)
 buffer = deep_gemm.get_symm_buffer_for_mega_moe(
     group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
     mma_type='fp8xfp4',  # Use 'fp8xfp8' for FP8 routed-expert weights
