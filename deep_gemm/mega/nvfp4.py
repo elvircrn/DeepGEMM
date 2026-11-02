@@ -45,9 +45,8 @@ class NVFP4SymmBuffer:
             if group.size() == 1:
                 self.buffer = torch.empty(num_bytes, dtype=torch.int8, device='cuda')
                 self.handle = types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
-                self._fabric_free_ptrs = None
             else:
-                self.buffer, self.handle, self._fabric_free_ptrs = _create_symm_buffer(num_bytes, group)
+                self.buffer, self.handle = _create_symm_buffer(num_bytes, group)
             self.buffer.zero_()
             self.group.barrier()
             torch.cuda.synchronize()
@@ -59,7 +58,6 @@ class NVFP4SymmBuffer:
                  f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
             self.buffer = base.buffer
             self.handle = base.handle
-            self._fabric_free_ptrs = None
 
         # Create input buffer views
         (self.x, self.x_sf,
@@ -71,12 +69,8 @@ class NVFP4SymmBuffer:
          self.x_scales) = slice_input_buffers(self.buffer)
 
     def destroy(self):
-        # Collective: every rank must call this after a `group.barrier()`;
-        # instances reusing a `base` buffer do not free (the owner does)
-        if self._fabric_free_ptrs is not None:
-            for ptr in self._fabric_free_ptrs:
-                _C.fabric_symm_buffer_free(ptr)
-            self._fabric_free_ptrs = None
+        # Releases this instance's references; on the fabric path the mappings are owned
+        # by the buffer tensor's storage deleter and freed when the last reference dies
         self.handle = None
         self.buffer = None
         self.group = None

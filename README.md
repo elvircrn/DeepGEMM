@@ -117,6 +117,8 @@ Mega MoE fuses and overlaps EP dispatch, linear 1 and linear 2 (FP8xFP4 or FP8xF
 # Allocate symmetric memory buffer
 # NOTES: requires PyTorch >= 2.9 with torch._symmetric_memory, or CUDA fabric handles
 #        (DG_SYMM_BUFFER_BACKEND, see docs/mega-moe-nvl72.md)
+#        the mappings are freed by reference count: dropping the buffer (or
+#        calling destroy()) frees them once the last view is gone
 buffer = deep_gemm.get_symm_buffer_for_mega_moe(
     group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
     mma_type='fp8xfp4',  # Use 'fp8xfp8' for FP8 routed-expert weights

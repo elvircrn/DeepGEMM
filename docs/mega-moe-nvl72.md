@@ -106,9 +106,13 @@ fabric handles.
 - Fabric allocations are granularity-aligned (2 MB typical), so the buffer can
   be slightly larger than requested. The `base` reuse path already tolerates a
   larger buffer.
-- `destroy` is collective: every rank calls it after a `group.barrier()`, and
-  only the instance that allocated frees (buffers reused through `base`
-  share the mapping).
+- Lifetime is reference counted, the same as the `torch._symmetric_memory`
+  path: the buffer tensor owns the rank's whole mapping set through its
+  storage deleter, so views and buffers reusing it through `base` keep the
+  mappings alive, and a buffer that simply goes out of scope frees them (no
+  leak without `destroy`). `destroy()` only drops one instance's references.
+  VMM keeps a physical allocation alive while any rank still maps it, so ranks
+  can tear down independently, without a barrier.
 - The kernels do not use NVSwitch multicast yet; fabric handles only provide
   point-to-point peer mappings, the same semantics the IPC path provides
   inside one instance.

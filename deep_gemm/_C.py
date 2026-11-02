@@ -429,8 +429,8 @@ def fabric_symm_buffer_alloc(num_bytes):
     return _torch_ops.fabric_symm_buffer_alloc(num_bytes)
 
 
-def fabric_symm_buffer_import(desc, num_bytes):
-    return _torch_ops.fabric_symm_buffer_import(desc, num_bytes)
+def fabric_symm_buffer_import(desc, num_bytes, group_key):
+    return _torch_ops.fabric_symm_buffer_import(desc, num_bytes, group_key)
 
 
 def fabric_symm_buffer_view(data_ptr, num_bytes):

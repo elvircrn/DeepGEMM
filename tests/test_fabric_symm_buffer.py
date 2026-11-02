@@ -79,7 +79,46 @@ def main() -> int:
     if rank == 0:
         print(f'Cross-rank writes verified on all {world_size} ranks')
 
-    # Collective teardown
+    # Lifetime: a dropped buffer must free its mappings (the tensor's storage
+    # deleter owns them); fabric allocations bypass the caching allocator, so
+    # a leak shows up directly in free device memory
+    free_before, _ = torch.cuda.mem_get_info()
+    for _ in range(4):
+        dropped = deep_gemm.SymmBuffer(
+            dist.group.WORLD, num_experts=world_size * 2,
+            num_max_tokens_per_rank=128, num_topk=8,
+            hidden=512, intermediate_hidden=256,
+            mma_type='fp8xfp4', activation='swiglu')
+        del dropped
+    torch.cuda.synchronize()
+    free_after, _ = torch.cuda.mem_get_info()
+    assert free_after >= free_before - buffer.buffer.nbytes, \
+        f'rank {rank}: dropping a SymmBuffer leaked fabric mappings ' \
+        f'({free_before - free_after} bytes of device memory lost)'
+    if rank == 0:
+        print('Dropped buffers free their mappings on all ranks')
+
+    # Lifetime: destroying a base must leave buffers reusing it valid (they
+    # share the buffer tensor, whose storage keeps the mappings alive)
+    base = deep_gemm.SymmBuffer(
+        dist.group.WORLD, num_experts=world_size * 2,
+        num_max_tokens_per_rank=128, num_topk=8,
+        hidden=512, intermediate_hidden=256,
+        mma_type='fp8xfp4', activation='swiglu')
+    borrower = deep_gemm.SymmBuffer(
+        dist.group.WORLD, num_experts=world_size * 2,
+        num_max_tokens_per_rank=128, num_topk=8,
+        hidden=512, intermediate_hidden=256,
+        mma_type='fp8xfp4', activation='swiglu', base=base)
+    base.destroy()
+    borrower.buffer.fill_(7)
+    assert bool((borrower.buffer == 7).all()), 'base destroy invalidated a reused buffer'
+    # Both must go: the base's remaining views keep the storage alive otherwise
+    del borrower, base
+    if rank == 0:
+        print('Buffers reusing a destroyed base stay valid')
+
+    # Teardown
     dist.barrier()
     buffer.destroy()
     dist.destroy_process_group()

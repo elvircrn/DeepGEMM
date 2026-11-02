@@ -19,7 +19,15 @@
 // service must be configured (`nvidia-imex-ctl -N`,
 // `/dev/nvidia-caps-imex-channels`). Unlike the IPC path, buffers set up this
 // way span every OS instance of one fabric, e.g. a partitioned NVL72.
+//
+// Ownership: the tensor returned by `alloc` owns the rank's whole mapping set
+// (its own allocation plus one import per peer) through its storage deleter,
+// so views and buffers reusing it through `base` keep the mappings alive and
+// a dropped buffer frees them, the same refcounted lifetime
+// `torch._symmetric_memory` provides. VMM keeps a physical allocation alive
+// while any rank still maps it, so ranks can tear down independently.
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -56,10 +64,14 @@ struct Mapping {
     CUmemGenericAllocationHandle handle;
 };
 
-// Outstanding mappings, freed by `fabric_symm_buffer_free` (the Python side
-// calls it from `SymmBuffer.destroy`, after a group barrier).
+// Outstanding mappings and the groups they belong to, guarded by `g_mutex`.
+// A group is the set of mappings one rank holds for one symmetric buffer: its
+// own allocation plus one import per peer, keyed by the local allocation
+// address (the `buffer_ptrs[rank]` entry). A group dies as a unit, through
+// `fabric_symm_buffer_free` or the storage deleter of the buffer tensor.
 static std::mutex g_mutex;
 static std::map<CUdeviceptr, Mapping> g_mappings;
+static std::map<CUdeviceptr, std::vector<CUdeviceptr>> g_groups;
 
 static int current_device() {
     int device;
@@ -118,6 +130,51 @@ static void track_mapping(const CUdeviceptr& address, const Mapping& mapping) {
     g_mappings.emplace(address, mapping);
 }
 
+// Register `address` (the local allocation or an import) as part of the group
+// keyed by `group_key`, the owner's local allocation address
+static void join_group(const CUdeviceptr& group_key, const CUdeviceptr& address) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_groups[group_key].push_back(address);
+}
+
+static void forget_group(const CUdeviceptr& group_key) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_groups.erase(group_key);
+}
+
+// Unmap and release every mapping of one group. Idempotent: a group that is
+// already gone is a no-op, so the storage deleter and an explicit
+// `fabric_symm_buffer_free` can both run for the same buffer.
+static void free_group(const CUdeviceptr& group_key) {
+    std::vector<CUdeviceptr> addresses;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto group = g_groups.find(group_key);
+        if (group == g_groups.end()) {
+            return;
+        }
+        addresses = std::move(group->second);
+        g_groups.erase(group);
+    }
+    // In-flight kernels may still touch the mappings; wait before unmapping
+    DG_CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
+    for (const auto& address : addresses) {
+        Mapping mapping{};
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            const auto it = g_mappings.find(address);
+            if (it == g_mappings.end()) {
+                continue;
+            }
+            mapping = it->second;
+            g_mappings.erase(it);
+        }
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemUnmap(address, mapping.num_bytes));
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemRelease(mapping.handle));
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemAddressFree(address, mapping.num_bytes));
+    }
+}
+
 static bool is_supported() {
     CUdevice device = 0;
     DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuDeviceGet(&device, current_device()));
@@ -147,16 +204,35 @@ static std::tuple<torch::stable::Tensor, std::vector<int64_t>> alloc(const int64
         DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemExportToShareableHandle(
             &fabric, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
         track_mapping(address, Mapping(aligned, handle));
+        join_group(address, address);
 
-        // Int8 view over the mapping; ownership stays with `fabric_symm_buffer_free`, not the tensor
-        auto buffer = torch_compat::from_blob(
-            reinterpret_cast<void*>(address), {static_cast<int64_t>(aligned)},
-            current_cuda_device(), torch::headeronly::ScalarType::Byte);
+        // Int8 view over the mapping. Its storage deleter owns the whole group
+        // (this mapping plus the peer imports registered under it), so views
+        // and buffers reusing this one through `base` keep the mappings alive
+        // and a dropped buffer frees them instead of leaking. The deleter runs
+        // wherever the storage dies, possibly during interpreter teardown, so
+        // it must not throw.
+        const CUdeviceptr group_key = address;
+        auto buffer = torch::stable::from_blob(
+            reinterpret_cast<void*>(address),
+            std::vector<int64_t>{static_cast<int64_t>(aligned)}, std::vector<int64_t>{1},
+            current_cuda_device(), torch::headeronly::ScalarType::Byte,
+            [group_key](void*) {
+                try {
+                    free_group(group_key);
+                } catch (...) {
+                }
+            });
         std::vector<int64_t> words(kFabricHandleNumWords);
         std::memcpy(words.data(), &fabric, sizeof(fabric));
         return {buffer, words};
     } catch (...) {
+        forget_group(address);
         if (address != 0) {
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_mappings.erase(address);
+            }
             DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemUnmap(address, aligned));
             DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemAddressFree(address, aligned));
         }
@@ -165,7 +241,9 @@ static std::tuple<torch::stable::Tensor, std::vector<int64_t>> alloc(const int64
     }
 }
 
-static int64_t import(const std::vector<int64_t>& words, const int64_t& num_bytes) {
+// Import a peer's descriptor and register the mapping in the group keyed by
+// `group_key`, the local allocation address of the buffer it belongs to
+static int64_t import(const std::vector<int64_t>& words, const int64_t& num_bytes, const int64_t& group_key) {
     DG_HOST_ASSERT(num_bytes > 0);
     DG_HOST_ASSERT(words.size() == kFabricHandleNumWords);
     // The descriptors are only meaningful between identical GPUs on one fabric,
@@ -180,28 +258,36 @@ static int64_t import(const std::vector<int64_t>& words, const int64_t& num_byte
     CUdeviceptr address = 0;
     try {
         address = map_allocation(handle, aligned);
+        track_mapping(address, Mapping(aligned, handle));
+        join_group(static_cast<CUdeviceptr>(group_key), address);
     } catch (...) {
         DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemRelease(handle));
         throw;
     }
-    track_mapping(address, Mapping(aligned, handle));
     return static_cast<int64_t>(address);
 }
 
+// Frees the group `data_ptr` belongs to: its own allocation or an imported
+// peer mapping. The Python failure path calls this with the local allocation
+// address; normal teardown goes through the tensor's storage deleter.
 static void free_buffer(const int64_t& data_ptr) {
-    Mapping mapping{};
+    const auto address = static_cast<CUdeviceptr>(data_ptr);
+    CUdeviceptr group_key = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        const auto it = g_mappings.find(static_cast<CUdeviceptr>(data_ptr));
-        DG_HOST_ASSERT(it != g_mappings.end());
-        mapping = it->second;
-        g_mappings.erase(it);
+        if (g_groups.count(address) != 0) {
+            group_key = address;
+        } else {
+            for (const auto& [key, members] : g_groups) {
+                if (std::find(members.begin(), members.end(), address) != members.end()) {
+                    group_key = key;
+                    break;
+                }
+            }
+        }
     }
-    // The caller synchronizes (SymmBuffer.destroy runs after a group barrier)
-    DG_CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
-    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemUnmap(data_ptr, mapping.num_bytes));
-    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemRelease(mapping.handle));
-    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemAddressFree(data_ptr, mapping.num_bytes));
+    DG_HOST_ASSERT(group_key != 0);  // Unknown pointer: nothing of ours to free
+    free_group(group_key);
 }
 
 // Non-owning int8 tensor over a mapping created by `alloc`/`import`, for tests and debugging
@@ -223,7 +309,7 @@ static std::tuple<torch::stable::Tensor, std::vector<int64_t>> alloc(const int64
     DG_HOST_UNREACHABLE("Fabric symmetric buffers need CUDA 12.1 or newer");
     return {};
 }
-static int64_t import(const std::vector<int64_t>&, const int64_t&) {
+static int64_t import(const std::vector<int64_t>&, const int64_t&, const int64_t&) {
     DG_HOST_UNREACHABLE("Fabric symmetric buffers need CUDA 12.1 or newer");
     return 0;
 }
@@ -243,7 +329,7 @@ static torch::stable::Tensor view_tensor(const int64_t&, const int64_t&) {
 STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("fabric_symm_buffer_supported() -> bool");
     m.def("fabric_symm_buffer_alloc(int num_bytes) -> (Tensor, int[])");
-    m.def("fabric_symm_buffer_import(int[] desc, int num_bytes) -> int");
+    m.def("fabric_symm_buffer_import(int[] desc, int num_bytes, int group_key) -> int");
     m.def("fabric_symm_buffer_view(int data_ptr, int num_bytes) -> Tensor");
     m.def("fabric_symm_buffer_free(int data_ptr) -> ()");
 }

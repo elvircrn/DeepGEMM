@@ -45,7 +45,7 @@ def _all_gather_int64(tensor: torch.Tensor, group: 'dist.ProcessGroup') -> list:
         return [t.cpu() for t in gathered]
 
 
-def _create_fabric_symm_buffer(num_bytes: int, group: 'dist.ProcessGroup') -> Tuple[torch.Tensor, Any, list]:
+def _create_fabric_symm_buffer(num_bytes: int, group: 'dist.ProcessGroup') -> Tuple[torch.Tensor, Any]:
     # Allocate through CUDA fabric handles and exchange the 64-byte descriptors over
     # `group`, so the buffer spans every OS instance of one NVLink fabric; the kernels
     # consume the local mappings of each rank's allocation as plain `buffer_ptrs`
@@ -53,26 +53,27 @@ def _create_fabric_symm_buffer(num_bytes: int, group: 'dist.ProcessGroup') -> Tu
         'CUDA fabric handles are unavailable on this device (no NVLink fabric, or the ' \
         'fabric/IMEX service is down, see docs/mega-moe-nvl72.md)'
     buffer, desc = _C.fabric_symm_buffer_alloc(num_bytes)
-    rank = group.rank()
-    descs = _all_gather_int64(torch.tensor(desc, dtype=torch.int64), group)
-
-    buffer_ptrs = [0] * group.size()
-    buffer_ptrs[rank] = buffer.data_ptr()
+    # One cleanup scope: if the exchange or any import fails, the local allocation is
+    # freed together with whatever was imported (the tensor's deleter covers the rest)
     try:
+        rank = group.rank()
+        descs = _all_gather_int64(torch.tensor(desc, dtype=torch.int64), group)
+        buffer_ptrs = [0] * group.size()
+        buffer_ptrs[rank] = buffer.data_ptr()
         for r, d in enumerate(descs):
             if r != rank:
-                buffer_ptrs[r] = _C.fabric_symm_buffer_import(d.tolist(), buffer.nbytes)
+                # Each import joins the group owned by the local buffer's storage deleter
+                buffer_ptrs[r] = _C.fabric_symm_buffer_import(d.tolist(), buffer.nbytes, buffer.data_ptr())
     except Exception:
-        for ptr in buffer_ptrs:
-            if ptr != 0:
-                _C.fabric_symm_buffer_free(ptr)
+        _C.fabric_symm_buffer_free(buffer.data_ptr())
         raise
-    return buffer, types.SimpleNamespace(buffer_ptrs=buffer_ptrs), buffer_ptrs
+    return buffer, types.SimpleNamespace(buffer_ptrs=buffer_ptrs)
 
 
-def _create_symm_buffer(num_bytes: int, group: 'dist.ProcessGroup') -> Tuple[torch.Tensor, Any, Optional[list]]:
-    # Returns the buffer, its handle and, for the fabric path, the mapped pointers to
-    # free on `destroy` (the owner frees; buffers reused through `base` share them)
+def _create_symm_buffer(num_bytes: int, group: 'dist.ProcessGroup') -> Tuple[torch.Tensor, Any]:
+    # Returns the buffer and its handle; on the fabric path the buffer tensor owns the
+    # mappings (freed when its last reference dies), matching the refcounted
+    # `torch._symmetric_memory` lifetime
     assert _SYMM_BUFFER_BACKEND in ('auto', 'fabric', 'symm_mem'), \
         f'DG_SYMM_BUFFER_BACKEND must be one of auto/fabric/symm_mem, got `{_SYMM_BUFFER_BACKEND}`'
     if _SYMM_BUFFER_BACKEND != 'fabric':
@@ -82,7 +83,7 @@ def _create_symm_buffer(num_bytes: int, group: 'dist.ProcessGroup') -> Tuple[tor
         else:
             try:
                 buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
-                return buffer, symm_mem.rendezvous(buffer, group=group), None
+                return buffer, symm_mem.rendezvous(buffer, group=group)
             except Exception as exception:
                 assert _SYMM_BUFFER_BACKEND == 'auto', \
                     f'DG_SYMM_BUFFER_BACKEND=symm_mem failed: {exception}'
@@ -127,9 +128,8 @@ class SymmBuffer:
             if group.size() == 1:
                 self.buffer = torch.empty(num_bytes, dtype=torch.int8, device='cuda')
                 self.handle = types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
-                self._fabric_free_ptrs = None
             else:
-                self.buffer, self.handle, self._fabric_free_ptrs = _create_symm_buffer(num_bytes, group)
+                self.buffer, self.handle = _create_symm_buffer(num_bytes, group)
             self.buffer.zero_()
             self.group.barrier()
             torch.cuda.synchronize()
@@ -141,7 +141,6 @@ class SymmBuffer:
                  f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
             self.buffer = base.buffer
             self.handle = base.handle
-            self._fabric_free_ptrs = None
 
         # Create input buffer views
         (self.x, self.x_sf,
@@ -152,12 +151,10 @@ class SymmBuffer:
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
 
     def destroy(self):
-        # Collective: every rank must call this after a `group.barrier()`;
-        # instances reusing a `base` buffer do not free (the owner does)
-        if self._fabric_free_ptrs is not None:
-            for ptr in self._fabric_free_ptrs:
-                _C.fabric_symm_buffer_free(ptr)
-            self._fabric_free_ptrs = None
+        # Releases this instance's references. On the fabric path the mappings are owned
+        # by the buffer tensor's storage deleter, so they stay valid while any view or
+        # `base`-reusing buffer is alive and are freed when the last reference dies;
+        # `torch._symmetric_memory` buffers are refcounted the same way
         self.handle = None
         self.buffer = None
         self.group = None
