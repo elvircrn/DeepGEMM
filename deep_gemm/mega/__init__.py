@@ -151,15 +151,26 @@ class SymmBuffer:
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
 
     def destroy(self):
-        # Releases this instance's references. On the fabric path the mappings are owned
-        # by the buffer tensor's storage deleter, so they stay valid while any view or
-        # `base`-reusing buffer is alive and are freed when the last reference dies;
-        # `torch._symmetric_memory` buffers are refcounted the same way
+        # Releases this instance's references, every view included: on the fabric
+        # path the mappings are owned by the buffer tensor's storage deleter, so
+        # they stay valid while any view or `base`-reusing buffer is alive and are
+        # freed when the last reference dies; `torch._symmetric_memory` buffers
+        # are refcounted the same way
         self.handle = None
         self.buffer = None
         self.group = None
         self.x = None
         self.x_sf = None
+        self.topk_idx = None
+        self.topk_weights = None
+        self.shared_l1_acts = None
+        self.shared_l1_acts_sf = None
+        self.shared_l2_acts = None
+        self.shared_l2_acts_sf = None
+        self.l1_acts = None
+        self.l1_acts_sf = None
+        self.l2_acts = None
+        self.l2_acts_sf = None
 
 
 # TODO: remove this function

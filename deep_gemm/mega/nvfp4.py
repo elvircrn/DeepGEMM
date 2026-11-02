@@ -69,13 +69,24 @@ class NVFP4SymmBuffer:
          self.x_scales) = slice_input_buffers(self.buffer)
 
     def destroy(self):
-        # Releases this instance's references; on the fabric path the mappings are owned
-        # by the buffer tensor's storage deleter and freed when the last reference dies
+        # Releases this instance's references, every view included; on the fabric
+        # path the mappings are owned by the buffer tensor's storage deleter and
+        # freed when the last reference dies
         self.handle = None
         self.buffer = None
         self.group = None
         self.x = None
         self.x_sf = None
+        self.topk_idx = None
+        self.topk_weights = None
+        self.shared_l1_acts = None
+        self.shared_l1_acts_sf = None
+        self.shared_l2_acts = None
+        self.shared_l2_acts_sf = None
+        self.l1_acts = None
+        self.l1_acts_sf = None
+        self.l2_acts = None
+        self.l2_acts_sf = None
         self.x_scales = None
 
 

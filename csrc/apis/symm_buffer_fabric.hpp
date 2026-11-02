@@ -198,6 +198,7 @@ static std::tuple<torch::stable::Tensor, std::vector<int64_t>> alloc(const int64
     DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemCreate(&handle, aligned, &prop, 0));
 
     CUdeviceptr address = 0;
+    bool owned_by_tensor = false;
     try {
         address = map_allocation(handle, aligned);
         CUmemFabricHandle fabric{};
@@ -205,13 +206,16 @@ static std::tuple<torch::stable::Tensor, std::vector<int64_t>> alloc(const int64
             &fabric, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
         track_mapping(address, Mapping(aligned, handle));
         join_group(address, address);
+        std::vector<int64_t> words(kFabricHandleNumWords);
+        std::memcpy(words.data(), &fabric, sizeof(fabric));
 
         // Int8 view over the mapping. Its storage deleter owns the whole group
         // (this mapping plus the peer imports registered under it), so views
         // and buffers reusing this one through `base` keep the mappings alive
         // and a dropped buffer frees them instead of leaking. The deleter runs
         // wherever the storage dies, possibly during interpreter teardown, so
-        // it must not throw.
+        // it must not throw. Everything fallible is done before the tensor
+        // exists; once it does, the deleter is the only cleanup path.
         const CUdeviceptr group_key = address;
         auto buffer = torch::stable::from_blob(
             reinterpret_cast<void*>(address),
@@ -223,20 +227,24 @@ static std::tuple<torch::stable::Tensor, std::vector<int64_t>> alloc(const int64
                 } catch (...) {
                 }
             });
-        std::vector<int64_t> words(kFabricHandleNumWords);
-        std::memcpy(words.data(), &fabric, sizeof(fabric));
-        return {buffer, words};
+        owned_by_tensor = true;
+        return {buffer, std::move(words)};
     } catch (...) {
-        forget_group(address);
-        if (address != 0) {
-            {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                g_mappings.erase(address);
+        // If the tensor was created, its destruction already ran the deleter
+        // and freed the group; freeing again would release handle and address
+        // twice
+        if (not owned_by_tensor) {
+            forget_group(address);
+            if (address != 0) {
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    g_mappings.erase(address);
+                }
+                DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemUnmap(address, aligned));
+                DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemAddressFree(address, aligned));
             }
-            DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemUnmap(address, aligned));
-            DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemAddressFree(address, aligned));
+            DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemRelease(handle));
         }
-        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemRelease(handle));
         throw;
     }
 }

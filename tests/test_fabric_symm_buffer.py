@@ -113,8 +113,8 @@ def main() -> int:
     base.destroy()
     borrower.buffer.fill_(7)
     assert bool((borrower.buffer == 7).all()), 'base destroy invalidated a reused buffer'
-    # Both must go: the base's remaining views keep the storage alive otherwise
-    del borrower, base
+    # destroy cleared the base's views, so the borrower is the last reference
+    del borrower
     if rank == 0:
         print('Buffers reusing a destroyed base stay valid')
 
