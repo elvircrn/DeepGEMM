@@ -113,8 +113,19 @@ def main() -> int:
     base.destroy()
     borrower.buffer.fill_(7)
     assert bool((borrower.buffer == 7).all()), 'base destroy invalidated a reused buffer'
-    # destroy cleared the base's views, so the borrower is the last reference
+    # destroy cleared the base's views, so the borrower is the last reference;
+    # deleting it must release the mappings, and the registry proves it: view
+    # asserts on a pointer it no longer knows
+    own_ptr, own_bytes = borrower.buffer.data_ptr(), borrower.buffer.nbytes
     del borrower
+    try:
+        _C.fabric_symm_buffer_view(own_ptr, own_bytes)
+        released = False
+    except Exception:
+        released = True
+    assert released, 'deleting the last borrower left the mappings alive'
+    if rank == 0:
+        print('Deleting the last borrower releases the mappings')
     if rank == 0:
         print('Buffers reusing a destroyed base stay valid')
 

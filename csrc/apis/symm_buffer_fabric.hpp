@@ -269,6 +269,17 @@ static int64_t import(const std::vector<int64_t>& words, const int64_t& num_byte
         track_mapping(address, Mapping(aligned, handle));
         join_group(static_cast<CUdeviceptr>(group_key), address);
     } catch (...) {
+        // The registration helpers can fail after the mapping exists; without
+        // this cleanup the address stays mapped and outside the group, where
+        // neither the storage deleter nor `fabric_symm_buffer_free` finds it
+        if (address != 0) {
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_mappings.erase(address);
+            }
+            DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemUnmap(address, aligned));
+            DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemAddressFree(address, aligned));
+        }
         DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemRelease(handle));
         throw;
     }
